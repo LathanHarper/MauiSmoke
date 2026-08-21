@@ -1,0 +1,376 @@
+name: TestFlight canary
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_number:
+        description: Unique numeric CFBundleVersion for this upload
+        required: true
+        type: string
+      confirm_upload:
+        description: Confirm this trusted main-branch build should be uploaded
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mauismoke-testflight
+  cancel-in-progress: false
+
+env:
+  BUNDLE_ID: net.codecrafty.mauismoke
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+  PROJECT_PATH: src/MauiSmoke/MauiSmoke.csproj
+  SDK_VERSION: 10.0.302
+  TARGET_FRAMEWORK: net10.0-ios
+  WORKLOAD_VERSION: 10.0.302.1
+
+jobs:
+  upload:
+    name: Sign and upload trusted main
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.confirm_upload == true }}
+    runs-on: macos-26
+    timeout-minutes: 90
+    environment:
+      name: testflight-canary
+
+    steps:
+      - name: Check out trusted source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Install pinned .NET SDK
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+
+      - name: Validate dispatch and toolchains
+        shell: bash
+        env:
+          REQUESTED_BUILD_NUMBER: ${{ inputs.build_number }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$REQUESTED_BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]] || [[ ${#REQUESTED_BUILD_NUMBER} -gt 18 ]]; then
+            echo "build_number must be a positive integer of at most 18 digits." >&2
+            exit 1
+          fi
+
+          test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(uname -m)" = "arm64"
+          test -d "$DEVELOPER_DIR"
+          test "$(dotnet --version)" = "$SDK_VERSION"
+          test "$(xcodebuild -version | sed -n '1p')" = "Xcode 26.6"
+
+          echo "BUILD_NUMBER=$REQUESTED_BUILD_NUMBER" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          dotnet --info
+
+      - name: Restore pinned MAUI and iOS workloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet workload restore "$PROJECT_PATH" \
+            -p:TargetFrameworks="$TARGET_FRAMEWORK" \
+            --skip-manifest-update
+          test "$(dotnet workload --version)" = "$WORKLOAD_VERSION"
+          dotnet workload list
+
+      - name: Restore locked package graph before loading credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet restore "$PROJECT_PATH" \
+            -p:TargetFrameworks="$TARGET_FRAMEWORK" \
+            -r ios-arm64 \
+            --locked-mode
+
+          configured_application_id="$(dotnet msbuild "$PROJECT_PATH" \
+            -nologo \
+            -p:TargetFramework="$TARGET_FRAMEWORK" \
+            -p:TargetFrameworks="$TARGET_FRAMEWORK" \
+            -getProperty:ApplicationId)"
+          test "$configured_application_id" = "$BUNDLE_ID"
+
+      - name: Import Apple distribution certificate
+        uses: Apple-Actions/import-codesign-certs@5142e029c445c10ffc7149d172e540235a065466 # v7.0.0
+        with:
+          p12-file-base64: ${{ secrets.IOS_DISTRIBUTION_CERT_P12_BASE64 }}
+          p12-password: ${{ secrets.IOS_DISTRIBUTION_CERT_P12_PASSWORD }}
+
+      - name: Install and validate App Store provisioning profile
+        id: profile
+        shell: bash
+        env:
+          PROFILE_BASE64: ${{ secrets.IOS_APPSTORE_PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+          test -n "$PROFILE_BASE64"
+
+          temporary_profile="$RUNNER_TEMP/MauiSmoke.mobileprovision"
+          profile_plist="$RUNNER_TEMP/MauiSmoke-profile.plist"
+          printf '%s' "$PROFILE_BASE64" | base64 -D > "$temporary_profile"
+          security cms -D -i "$temporary_profile" > "$profile_plist"
+
+          profile_uuid="$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$profile_plist")"
+          profile_name="$(/usr/libexec/PlistBuddy -c 'Print :Name' "$profile_plist")"
+          team_id="$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$profile_plist")"
+          application_identifier="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$profile_plist")"
+          expected_application_identifier="$team_id.$BUNDLE_ID"
+          get_task_allow="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$profile_plist")"
+          beta_reports_active="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:beta-reports-active' "$profile_plist")"
+          expiration_date="$(plutil -extract ExpirationDate raw -o - "$profile_plist")"
+          expiration_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$expiration_date" '+%s')"
+
+          if [[ "$application_identifier" != "$expected_application_identifier" ]]; then
+            echo "Provisioning profile is for $application_identifier, expected $expected_application_identifier." >&2
+            exit 1
+          fi
+          if [[ "$get_task_allow" != "false" || "$beta_reports_active" != "true" ]]; then
+            echo "Provisioning profile is not an App Store/TestFlight distribution profile." >&2
+            exit 1
+          fi
+          if /usr/libexec/PlistBuddy -c 'Print :ProvisionedDevices' "$profile_plist" >/dev/null 2>&1; then
+            echo "Provisioning profile is device-scoped, not App Store distribution." >&2
+            exit 1
+          fi
+          if /usr/libexec/PlistBuddy -c 'Print :ProvisionsAllDevices' "$profile_plist" >/dev/null 2>&1; then
+            echo "Provisioning profile is enterprise-scoped, not App Store distribution." >&2
+            exit 1
+          fi
+          if (( expiration_epoch <= $(date -u '+%s') )); then
+            echo "Provisioning profile expired at $expiration_date." >&2
+            exit 1
+          fi
+
+          profile_directory="$HOME/Library/MobileDevice/Provisioning Profiles"
+          installed_profile="$profile_directory/$profile_uuid.mobileprovision"
+          mkdir -p "$profile_directory"
+          install -m 600 "$temporary_profile" "$installed_profile"
+
+          echo "profile_name=$profile_name" >> "$GITHUB_OUTPUT"
+          echo "profile_path=$installed_profile" >> "$GITHUB_OUTPUT"
+          echo "profile_team_id=$team_id" >> "$GITHUB_OUTPUT"
+          echo "profile_uuid=$profile_uuid" >> "$GITHUB_OUTPUT"
+
+      - name: Verify signing identity
+        shell: bash
+        env:
+          IOS_CODESIGN_IDENTITY: ${{ vars.IOS_CODESIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          test -n "$IOS_CODESIGN_IDENTITY"
+          if ! security find-identity -v -p codesigning | grep -F -- "\"$IOS_CODESIGN_IDENTITY\""; then
+            echo "Configured IOS_CODESIGN_IDENTITY was not imported." >&2
+            exit 1
+          fi
+
+      - name: Publish signed App Store IPA
+        shell: bash
+        env:
+          IOS_CODESIGN_IDENTITY: ${{ vars.IOS_CODESIGN_IDENTITY }}
+          PROFILE_NAME: ${{ steps.profile.outputs.profile_name }}
+        run: |
+          set -euo pipefail
+          dotnet publish "$PROJECT_PATH" \
+            -f "$TARGET_FRAMEWORK" \
+            -c Release \
+            -r ios-arm64 \
+            --no-restore \
+            -p:TargetFrameworks="$TARGET_FRAMEWORK" \
+            -p:ApplicationId="$BUNDLE_ID" \
+            -p:ApplicationVersion="$BUILD_NUMBER" \
+            -p:ArchiveOnBuild=true \
+            -p:CodesignKey="$IOS_CODESIGN_IDENTITY" \
+            -p:CodesignProvision="$PROFILE_NAME" \
+            -p:ContinuousIntegrationBuild=true \
+            -p:EnableCodeSigning=true
+
+      - name: Verify exact signed IPA identity
+        id: ipa
+        shell: bash
+        env:
+          EXPECTED_CODESIGN_IDENTITY: ${{ vars.IOS_CODESIGN_IDENTITY }}
+          EXPECTED_PROFILE_TEAM_ID: ${{ steps.profile.outputs.profile_team_id }}
+          EXPECTED_PROFILE_UUID: ${{ steps.profile.outputs.profile_uuid }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          project_dir="$(dirname "$PROJECT_PATH")"
+          publish_directory="$project_dir/bin/Release/$TARGET_FRAMEWORK/ios-arm64/publish"
+          ipa_files=("$publish_directory"/*.ipa)
+          if [[ ${#ipa_files[@]} -ne 1 ]]; then
+            echo "Expected exactly one IPA under $publish_directory; found ${#ipa_files[@]}." >&2
+            exit 1
+          fi
+
+          verification_directory="$RUNNER_TEMP/MauiSmoke-ipa-verification"
+          mkdir -p "$verification_directory"
+          unzip -q "${ipa_files[0]}" -d "$verification_directory"
+          app_bundles=("$verification_directory"/Payload/*.app)
+          if [[ ${#app_bundles[@]} -ne 1 ]]; then
+            echo "Expected exactly one app bundle inside the IPA; found ${#app_bundles[@]}." >&2
+            exit 1
+          fi
+
+          app_bundle="${app_bundles[0]}"
+          info_plist="$app_bundle/Info.plist"
+          test -f "$info_plist"
+          test -f "$app_bundle/embedded.mobileprovision"
+          test -f "$app_bundle/PrivacyInfo.xcprivacy"
+
+          actual_bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info_plist")"
+          actual_build_number="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$info_plist")"
+          executable_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$info_plist")"
+          test "$actual_bundle_id" = "$BUNDLE_ID"
+          test "$actual_build_number" = "$BUILD_NUMBER"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$info_plist")" = "15.0"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :UIDeviceFamily:0' "$info_plist")" = "1"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :UIDeviceFamily:1' "$info_plist")" = "2"
+          test "$(lipo -archs "$app_bundle/$executable_name")" = "arm64"
+
+          codesign --verify --deep --strict --verbose=2 "$app_bundle"
+          signing_authority="$(codesign -d --verbose=4 "$app_bundle" 2>&1 | sed -n 's/^Authority=//p' | head -n 1)"
+          signed_team_id="$(codesign -d --verbose=4 "$app_bundle" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+          test "$signing_authority" = "$EXPECTED_CODESIGN_IDENTITY"
+          test "$signed_team_id" = "$EXPECTED_PROFILE_TEAM_ID"
+
+          signed_entitlements="$RUNNER_TEMP/MauiSmoke-signed-entitlements.plist"
+          codesign -d --entitlements :- "$app_bundle" > "$signed_entitlements" 2>/dev/null
+          signed_application_identifier="$(/usr/libexec/PlistBuddy -c 'Print :application-identifier' "$signed_entitlements")"
+          signed_entitlement_team_id="$(/usr/libexec/PlistBuddy -c 'Print :com.apple.developer.team-identifier' "$signed_entitlements")"
+          signed_get_task_allow="$(/usr/libexec/PlistBuddy -c 'Print :get-task-allow' "$signed_entitlements")"
+          signed_beta_reports_active="$(/usr/libexec/PlistBuddy -c 'Print :beta-reports-active' "$signed_entitlements")"
+          test "$signed_application_identifier" = "$EXPECTED_PROFILE_TEAM_ID.$BUNDLE_ID"
+          test "$signed_entitlement_team_id" = "$EXPECTED_PROFILE_TEAM_ID"
+          test "$signed_get_task_allow" = "false"
+          test "$signed_beta_reports_active" = "true"
+
+          embedded_profile_plist="$RUNNER_TEMP/MauiSmoke-embedded-profile.plist"
+          security cms -D -i "$app_bundle/embedded.mobileprovision" > "$embedded_profile_plist"
+          embedded_uuid="$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$embedded_profile_plist")"
+          embedded_team_id="$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$embedded_profile_plist")"
+          embedded_application_identifier="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$embedded_profile_plist")"
+          embedded_get_task_allow="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:get-task-allow' "$embedded_profile_plist")"
+          test "$embedded_uuid" = "$EXPECTED_PROFILE_UUID"
+          test "$embedded_team_id" = "$EXPECTED_PROFILE_TEAM_ID"
+          test "$embedded_application_identifier" = "$EXPECTED_PROFILE_TEAM_ID.$BUNDLE_ID"
+          test "$embedded_get_task_allow" = "false"
+
+          echo "ipa=${ipa_files[0]}" >> "$GITHUB_OUTPUT"
+          echo "app_executable=$app_bundle/$executable_name" >> "$GITHUB_OUTPUT"
+
+      - name: Package symbolication diagnostics only
+        id: symbols
+        shell: bash
+        env:
+          APP_EXECUTABLE: ${{ steps.ipa.outputs.app_executable }}
+          IPA_PATH: ${{ steps.ipa.outputs.ipa }}
+        run: |
+          set -euo pipefail
+
+          project_dir="$(dirname "$PROJECT_PATH")"
+          diagnostics="$RUNNER_TEMP/MauiSmoke-symbolication"
+          copied_dsyms="$diagnostics/dSYMs"
+          mkdir -p "$copied_dsyms"
+
+          dsyms=()
+          for search_root in \
+            "$project_dir/bin/Release/$TARGET_FRAMEWORK/ios-arm64" \
+            "$HOME/Library/Developer/Xcode/Archives"; do
+            if [[ -d "$search_root" ]]; then
+              while IFS= read -r -d '' dsym; do
+                dsyms+=("$dsym")
+              done < <(find "$search_root" -type d -name '*.dSYM' -print0 -prune)
+            fi
+          done
+
+          if [[ ${#dsyms[@]} -eq 0 ]]; then
+            echo "No dSYM bundles were generated; refusing an unsymbolicatable canary." >&2
+            exit 1
+          fi
+
+          : > "$diagnostics/dsym-uuids.txt"
+          index=0
+          for dsym in "${dsyms[@]}"; do
+            index=$((index + 1))
+            destination="$copied_dsyms/$(printf '%02d' "$index")-$(basename "$dsym")"
+            ditto "$dsym" "$destination"
+            xcrun dwarfdump --uuid "$destination" >> "$diagnostics/dsym-uuids.txt"
+          done
+
+          xcrun dwarfdump --uuid "$APP_EXECUTABLE" > "$diagnostics/app-uuid.txt"
+          {
+            echo "commit=$GITHUB_SHA"
+            echo "bundle_id=$BUNDLE_ID"
+            echo "build_number=$BUILD_NUMBER"
+            echo "target_framework=$TARGET_FRAMEWORK"
+            echo "runtime_identifier=ios-arm64"
+            echo "dotnet_sdk=$(dotnet --version)"
+            echo "workload_set=$(dotnet workload --version)"
+            echo "ipa_sha256=$(shasum -a 256 "$IPA_PATH" | awk '{print $1}')"
+            xcodebuild -version | tr '\n' ' '
+            echo
+          } > "$diagnostics/build-info.txt"
+
+          symbols_zip="$diagnostics/MauiSmoke-build-$BUILD_NUMBER-dSYMs.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$copied_dsyms" "$symbols_zip"
+          shasum -a 256 "$symbols_zip" > "$diagnostics/SHA256SUMS.txt"
+
+          rm -rf -- "$copied_dsyms"
+          echo "path=$diagnostics" >> "$GITHUB_OUTPUT"
+
+      - name: Upload short-lived symbolication diagnostics
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mauismoke-symbols-build-${{ inputs.build_number }}-${{ github.sha }}
+          path: ${{ steps.symbols.outputs.path }}
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 7
+
+      - name: Upload directly to TestFlight and wait for processing
+        uses: Apple-Actions/upload-testflight-build@5e75ff58276689011512ba87a381d93dc67dbcf8 # v5.3.0
+        with:
+          app-path: ${{ steps.ipa.outputs.ipa }}
+          issuer-id: ${{ vars.APPSTORE_ISSUER_ID }}
+          api-key-id: ${{ vars.APPSTORE_API_KEY_ID }}
+          api-private-key: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+          backend: AppStoreAPI
+          wait-for-processing: "true"
+
+      - name: Remove temporary provisioning and verification material
+        if: always()
+        shell: bash
+        env:
+          INSTALLED_PROFILE: ${{ steps.profile.outputs.profile_path }}
+        run: |
+          set -euo pipefail
+          expected_profile_root="$HOME/Library/MobileDevice/Provisioning Profiles/"
+          if [[ -n "${INSTALLED_PROFILE:-}" && "$INSTALLED_PROFILE" == "$expected_profile_root"*.mobileprovision ]]; then
+            rm -f -- "$INSTALLED_PROFILE"
+          fi
+          for temporary_directory in \
+            "$RUNNER_TEMP/MauiSmoke-ipa-verification" \
+            "$RUNNER_TEMP/MauiSmoke-symbolication"; do
+            if [[ "$temporary_directory" == "$RUNNER_TEMP/"* && -d "$temporary_directory" ]]; then
+              rm -rf -- "$temporary_directory"
+            fi
+          done
+          rm -f -- \
+            "$RUNNER_TEMP/MauiSmoke.mobileprovision" \
+            "$RUNNER_TEMP/MauiSmoke-profile.plist" \
+            "$RUNNER_TEMP/MauiSmoke-signed-entitlements.plist" \
+            "$RUNNER_TEMP/MauiSmoke-embedded-profile.plist"

@@ -1,0 +1,28 @@
+# Build output
+**/bin/
+**/obj/
+artifacts/
+TestResults/
+
+# IDE and operating-system files
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+.DS_Store
+Thumbs.db
+
+# Apple build and signing material
+*.ipa
+*.xcarchive/
+*.dSYM/
+*.p8
+*.p12
+*.cer
+*.mobileprovision
+
+# Local secrets and environment files
+.env
+.env.*
+secrets.*

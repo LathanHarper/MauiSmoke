@@ -1,0 +1,200 @@
+name: iOS unsigned proof
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mauismoke-ios-unsigned-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUNDLE_ID: net.codecrafty.mauismoke
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+  PROJECT_PATH: src/MauiSmoke/MauiSmoke.csproj
+  SDK_VERSION: 10.0.302
+  TARGET_FRAMEWORK: net10.0-ios
+  WORKLOAD_VERSION: 10.0.302.1
+
+jobs:
+  build:
+    name: Simulator and device binaries
+    runs-on: macos-26
+    timeout-minutes: 75
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install pinned .NET SDK
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+
+      - name: Verify Apple and .NET toolchains
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "arm64"
+          test -d "$DEVELOPER_DIR"
+          test "$(dotnet --version)" = "$SDK_VERSION"
+          test "$(xcodebuild -version | sed -n '1p')" = "Xcode 26.6"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun --sdk iphonesimulator --show-sdk-version
+          dotnet --info
+
+      - name: Restore pinned MAUI and iOS workloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet workload restore "$PROJECT_PATH" \
+            -p:TargetFrameworks="$TARGET_FRAMEWORK" \
+            --skip-manifest-update
+          test "$(dotnet workload --version)" = "$WORKLOAD_VERSION"
+          dotnet workload list
+
+      - name: Restore locked package graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet restore "$PROJECT_PATH" \
+            -p:TargetFrameworks="$TARGET_FRAMEWORK" \
+            --locked-mode
+
+          configured_application_id="$(dotnet msbuild "$PROJECT_PATH" \
+            -nologo \
+            -p:TargetFramework="$TARGET_FRAMEWORK" \
+            -p:TargetFrameworks="$TARGET_FRAMEWORK" \
+            -getProperty:ApplicationId)"
+          test "$configured_application_id" = "$BUNDLE_ID"
+
+      - name: Build unsigned simulator binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          dotnet build "$PROJECT_PATH" \
+            -f "$TARGET_FRAMEWORK" \
+            -c Release \
+            -r iossimulator-arm64 \
+            --no-restore \
+            -p:ApplicationId="$BUNDLE_ID" \
+            -p:ApplicationTitle="MauiSmoke - UNSIGNED PROOF" \
+            -p:ArchiveOnBuild=false \
+            -p:ContinuousIntegrationBuild=true \
+            -p:EnableCodeSigning=false \
+            -bl:artifacts/iossimulator-arm64.binlog
+
+      - name: Build unsigned device binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet build "$PROJECT_PATH" \
+            -f "$TARGET_FRAMEWORK" \
+            -c Release \
+            -r ios-arm64 \
+            --no-restore \
+            -p:ApplicationId="$BUNDLE_ID" \
+            -p:ApplicationTitle="MauiSmoke - UNSIGNED PROOF" \
+            -p:ArchiveOnBuild=false \
+            -p:ContinuousIntegrationBuild=true \
+            -p:EnableCodeSigning=false \
+            -bl:artifacts/ios-arm64.binlog
+
+      - name: Package return-to-sender proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          project_dir="$(dirname "$PROJECT_PATH")"
+          simulator_root="$project_dir/bin/Release/$TARGET_FRAMEWORK/iossimulator-arm64"
+          device_root="$project_dir/bin/Release/$TARGET_FRAMEWORK/ios-arm64"
+          simulator_apps=("$simulator_root"/*.app)
+          device_apps=("$device_root"/*.app)
+
+          if [[ ${#simulator_apps[@]} -ne 1 ]]; then
+            echo "Expected exactly one simulator app under $simulator_root; found ${#simulator_apps[@]}." >&2
+            exit 1
+          fi
+          if [[ ${#device_apps[@]} -ne 1 ]]; then
+            echo "Expected exactly one device app under $device_root; found ${#device_apps[@]}." >&2
+            exit 1
+          fi
+
+          for app_bundle in "${simulator_apps[0]}" "${device_apps[0]}"; do
+            info_plist="$app_bundle/Info.plist"
+            test -f "$app_bundle/PrivacyInfo.xcprivacy"
+            test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info_plist")" = "$BUNDLE_ID"
+            test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$info_plist")" = "MauiSmoke - UNSIGNED PROOF"
+            test "$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$info_plist")" = "15.0"
+            test "$(/usr/libexec/PlistBuddy -c 'Print :UIDeviceFamily:0' "$info_plist")" = "1"
+            test "$(/usr/libexec/PlistBuddy -c 'Print :UIDeviceFamily:1' "$info_plist")" = "2"
+          done
+
+          ditto -c -k --sequesterRsrc --keepParent \
+            "${simulator_apps[0]}" artifacts/MauiSmoke-iossimulator-arm64-unsigned.zip
+          ditto -c -k --sequesterRsrc --keepParent \
+            "${device_apps[0]}" artifacts/MauiSmoke-ios-arm64-unsigned.zip
+
+          (
+            cd artifacts
+            shasum -a 256 \
+              MauiSmoke-iossimulator-arm64-unsigned.zip \
+              MauiSmoke-ios-arm64-unsigned.zip > SHA256SUMS.txt
+          )
+
+          {
+            echo "commit=$GITHUB_SHA"
+            echo "bundle_id=$BUNDLE_ID"
+            echo "dotnet_sdk=$(dotnet --version)"
+            echo "workload_set=$(dotnet workload --version)"
+            echo "simulator_architectures=$(lipo -archs "${simulator_apps[0]}/MauiSmoke")"
+            echo "device_architectures=$(lipo -archs "${device_apps[0]}/MauiSmoke")"
+            xcodebuild -version | tr '\n' ' '
+            echo
+          } > artifacts/build-info.txt
+
+          cp LICENSE artifacts/MAUISMOKE-LICENSE.txt
+          cp THIRD-PARTY-NOTICES.md artifacts/THIRD-PARTY-NOTICES.md
+          cp "$project_dir/packages.lock.json" artifacts/packages.lock.json
+
+          {
+            printf '%s\n' 'MAUISMOKE iOS BUILD PROOF — RETURN TO SENDER'
+            printf '%s\n' 'UNSIGNED: not accepted by TestFlight and not installable on a physical iPhone or iPad.'
+            printf '%s\n' 'The simulator archive is only for compatible Apple simulator tooling.'
+            printf 'commit=%s\n' "$GITHUB_SHA"
+            printf 'bundle_id=%s\n' "$BUNDLE_ID"
+          } > artifacts/RETURN-TO-SENDER.txt
+
+      - name: Upload unsigned proof
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mauismoke-ios-return-to-sender-${{ github.sha }}
+          path: |
+            artifacts/MauiSmoke-iossimulator-arm64-unsigned.zip
+            artifacts/MauiSmoke-ios-arm64-unsigned.zip
+            artifacts/SHA256SUMS.txt
+            artifacts/build-info.txt
+            artifacts/MAUISMOKE-LICENSE.txt
+            artifacts/THIRD-PARTY-NOTICES.md
+            artifacts/packages.lock.json
+            artifacts/RETURN-TO-SENDER.txt
+            artifacts/*.binlog
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 7
