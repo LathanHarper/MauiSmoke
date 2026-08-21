@@ -298,21 +298,33 @@ jobs:
             fi
           done
 
-          if [[ ${#dsyms[@]} -eq 0 ]]; then
-            echo "No dSYM bundles were generated; refusing an unsymbolicatable canary." >&2
+          xcrun dwarfdump --uuid "$APP_EXECUTABLE" > "$diagnostics/app-uuid.txt"
+          app_uuids="$(awk '{print $2}' "$diagnostics/app-uuid.txt" | sort -u)"
+          if [[ -z "$app_uuids" ]]; then
+            echo "The signed app executable has no readable Mach-O UUID." >&2
             exit 1
           fi
 
-          : > "$diagnostics/dsym-uuids.txt"
-          index=0
+          matched_dsym=""
           for dsym in "${dsyms[@]}"; do
-            index=$((index + 1))
-            destination="$copied_dsyms/$(printf '%02d' "$index")-$(basename "$dsym")"
-            ditto "$dsym" "$destination"
-            xcrun dwarfdump --uuid "$destination" >> "$diagnostics/dsym-uuids.txt"
+            dsym_uuids="$(xcrun dwarfdump --uuid "$dsym" | awk '{print $2}' | sort -u)"
+            matching_uuids="$(comm -12 \
+              <(printf '%s\n' "$app_uuids") \
+              <(printf '%s\n' "$dsym_uuids"))"
+            if [[ -n "$matching_uuids" ]]; then
+              matched_dsym="$dsym"
+              break
+            fi
           done
 
-          xcrun dwarfdump --uuid "$APP_EXECUTABLE" > "$diagnostics/app-uuid.txt"
+          if [[ -z "$matched_dsym" ]]; then
+            echo "No generated dSYM UUID matches the signed app executable; refusing an unsymbolicatable canary." >&2
+            exit 1
+          fi
+
+          destination="$copied_dsyms/$(basename "$matched_dsym")"
+          ditto "$matched_dsym" "$destination"
+          xcrun dwarfdump --uuid "$destination" > "$diagnostics/dsym-uuids.txt"
           {
             echo "commit=$GITHUB_SHA"
             echo "bundle_id=$BUNDLE_ID"
