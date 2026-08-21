@@ -141,6 +141,7 @@ jobs:
             test -f "$app_bundle/PrivacyInfo.xcprivacy"
             test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info_plist")" = "$BUNDLE_ID"
             test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$info_plist")" = "MauiSmoke - UNSIGNED PROOF"
+            test "$(/usr/libexec/PlistBuddy -c 'Print :ITSAppUsesNonExemptEncryption' "$info_plist")" = "false"
             test "$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$info_plist")" = "15.0"
             test "$(/usr/libexec/PlistBuddy -c 'Print :UIDeviceFamily:0' "$info_plist")" = "1"
             test "$(/usr/libexec/PlistBuddy -c 'Print :UIDeviceFamily:1' "$info_plist")" = "2"

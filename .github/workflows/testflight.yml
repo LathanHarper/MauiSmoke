@@ -236,6 +236,7 @@ jobs:
           executable_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$info_plist")"
           test "$actual_bundle_id" = "$BUNDLE_ID"
           test "$actual_build_number" = "$BUILD_NUMBER"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :ITSAppUsesNonExemptEncryption' "$info_plist")" = "false"
           test "$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$info_plist")" = "15.0"
           test "$(/usr/libexec/PlistBuddy -c 'Print :UIDeviceFamily:0' "$info_plist")" = "1"
           test "$(/usr/libexec/PlistBuddy -c 'Print :UIDeviceFamily:1' "$info_plist")" = "2"
